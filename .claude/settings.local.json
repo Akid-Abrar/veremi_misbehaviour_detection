@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import xgboost; print\\('xgboost ok'\\)\")",
+      "Bash(python -c \"import sklearn; print\\('sklearn ok'\\)\")",
+      "Bash(python *)"
+    ]
+  }
+}
