@@ -1,0 +1,252 @@
+VeReMi Misbehavior Detection — Conceptual Questions & Answers
+==============================================================
+
+
+Q1. What is the Macro-F1 score?
+---------------------------------
+The F1 score for a single class is the harmonic mean of that class's Precision and Recall:
+
+    F1_class = 2 * (Precision * Recall) / (Precision + Recall)
+
+Precision for class C = (true positives for C) / (all predictions of C)
+  — "of everything the model called C, how many actually were C?"
+
+Recall for class C = (true positives for C) / (all actual instances of C)
+  — "of everything that truly was C, how many did the model find?"
+
+The harmonic mean punishes models that are strong on one but weak on the other. A model
+with 100% precision but 0% recall (predicts C only once, and gets it right) earns F1 = 0.
+A model that is balanced on both earns a high F1.
+
+Macro-F1 is simply the unweighted average of the per-class F1 scores across all 20 classes:
+
+    Macro-F1 = (1/20) * sum(F1_class_i, i=0..19)
+
+Every class contributes equally regardless of how many samples it has.
+
+
+Q2. Why is Macro-F1 different from "regular" (Micro) F1?
+----------------------------------------------------------
+"Regular" F1 usually means micro-averaged F1 (or accuracy in the multi-class setting):
+it pools all true positives, false positives, and false negatives across every class before
+computing a single precision and recall. Because the pooled counts are dominated by the
+majority class (Class 0 — Normal, with ~1.9 M samples), micro-F1 reflects how well the
+model does on Normal behavior far more than on the 19 attack classes.
+
+Example: a model that perfectly classifies Normal but always misclassifies every attack type
+would have micro-F1 ≈ 0.59 (just labeling everything as Normal) but Macro-F1 ≈ 0.03,
+correctly revealing it is useless for detection.
+
+Macro-F1 prevents the majority class from hiding poor performance on rare but
+safety-critical attack classes.
+
+
+Q3. Why have we used only Macro-F1 for primary validation, ignoring accuracy and precision?
+---------------------------------------------------------------------------------------------
+Accuracy:
+  Because the dataset is severely imbalanced (Class 0 is 59% of all rows), a model that
+  predicts "Normal" for every single message achieves ~59% accuracy without detecting a
+  single attack. Accuracy is therefore a misleading metric here. We report it for
+  completeness, but it is not used to rank or select models.
+
+Precision (alone):
+  Precision measures false-alarm rate but ignores missed detections. A model that
+  predicts attacks only when 100% certain has perfect precision but catches almost
+  nothing (recall ≈ 0). In a safety-critical V2X context, missing an actual attack
+  (false negative) is more dangerous than an occasional false alarm. Using precision
+  alone would reward overly conservative classifiers.
+
+Macro-F1:
+  It is the standard metric for imbalanced multi-class problems in the V2X misbehavior
+  detection literature. It forces the model to perform reasonably well on *every* class
+  — including the rare attack types — not just the dominant one. It also balances
+  precision and recall, so the model cannot game the score by being overly cautious or
+  overly aggressive.
+
+  Precision, Recall, and per-class F1 are still reported in the full classification_report
+  output; they are just not used as the headline comparison metric.
+
+
+Q4. Why did we scale the features (StandardScaler) but not normalize them (MinMaxScaler)?
+-------------------------------------------------------------------------------------------
+Scaling (StandardScaler): subtracts the mean and divides by the standard deviation.
+  Result: each feature has mean = 0 and std = 1. The transformed values are not bounded.
+
+Normalizing (MinMaxScaler): maps each feature to the [0, 1] interval using min/max.
+  Result: bounded but heavily distorted by extreme outliers.
+
+Reasons for choosing StandardScaler here:
+
+1. Outlier robustness: The VeReMi dataset contains misbehaving vehicles with intentionally
+   extreme positions, speeds, or accelerations (e.g., Constant Position attack teleports
+   a vehicle to a fixed GPS coordinate far from traffic). MinMaxScaler would compress the
+   majority of normal values into a tiny slice of [0, 1], making the distance geometry
+   almost useless for k-NN.
+
+2. k-NN requires scale equalization but not bounded ranges: k-NN uses Euclidean distance.
+   Without scaling, a feature measured in meters (position: ~thousands) would dominate
+   over a feature in m/s (speed: ~tens). StandardScaler gives each feature equal weight
+   in distance calculations without distorting the distribution shape.
+
+3. Tree-based models (RF, XGBoost) are scale-invariant: splits are based on rank order,
+   so scaling does not change their predictions at all. We scale them anyway so all models
+   share the same preprocessed input, making comparisons fair.
+
+4. Statistical assumption: StandardScaler is appropriate when features are roughly
+   bell-shaped or have outliers; MinMaxScaler is better only when the data is clean and
+   truly bounded. Kinematic sensor data typically satisfies the former, not the latter.
+
+
+Q5. What does "stratified" mean (in stratified sampling and stratified train/test split)?
+------------------------------------------------------------------------------------------
+Stratified means the class proportions are preserved after splitting or sampling.
+
+For train/test split: if Class 0 is 59.3% of the full dataset, then the training set
+and the test set also each contain approximately 59.3% Class 0 rows. Every class's
+share is maintained in both halves. Without stratification, a random split might place
+all instances of a rare class in the training set and leave none for testing, making it
+impossible to evaluate performance on that class.
+
+For stratified sampling (k-NN subset, CV sample): when we draw a smaller sample from
+the training data, we again maintain the original proportions. This ensures that rare
+attack classes (some with only ~1.3% of total data) are not accidentally excluded from
+the sample, which would bias model training and evaluation.
+
+In scikit-learn, this is controlled by the `stratify=y` argument in train_test_split
+and `StratifiedKFold` in cross-validation.
+
+For 5-fold stratified cross-validation specifically: the dataset is divided into 5 folds
+such that each fold has the same class distribution as the full dataset. Each fold is used
+once as the validation set; the remaining 4 folds train the model. The result is 5 Macro-F1
+scores whose mean ± std captures both model performance and its stability across data splits.
+
+
+Q6. What are the reasons behind the chosen hyperparameters?
+-------------------------------------------------------------
+
+Random Forest (n_estimators=200, max_depth=None, min_samples_leaf=5,
+               class_weight='balanced', oob_score=True):
+
+  n_estimators=200:
+    More trees = lower variance (the ensemble averages out individual tree noise).
+    200 is a practical balance between stability and training time for a ~2.55M-row
+    dataset. Diminishing returns set in beyond ~150 trees for tabular data.
+
+  max_depth=None:
+    Fully grown trees capture all feature interactions in the data. RF relies on
+    bagging (random subsets of rows + features) to prevent overfitting, not depth
+    limiting. With min_samples_leaf=5, leaves must have at least 5 samples, providing
+    a natural regularization floor without an arbitrary depth cap.
+
+  min_samples_leaf=5:
+    Prevents memorizing tiny clusters of outliers. Especially important on a 3.19M-row
+    dataset where a single leaf could fit 1–2 noise samples if unconstrained.
+
+  class_weight='balanced':
+    Inversely weights each class by its frequency: weight_c = n_samples / (n_classes * n_c).
+    This forces the model to treat a misclassification of a rare attack class as equally
+    penalizing as a misclassification of the dominant Normal class. Without this, RF would
+    be biased toward predicting Normal everywhere since that minimizes raw impurity.
+
+  oob_score=True:
+    Each tree is trained on a bootstrap sample (~63% of data). The remaining ~37%
+    (out-of-bag samples) provide a free validation estimate without touching the held-out
+    test set. It is a useful sanity check but not used for final model selection.
+
+XGBoost (n_estimators=300, max_depth=6, learning_rate=0.1,
+          subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0):
+
+  n_estimators=300:
+    XGBoost builds trees sequentially; more trees correct more residual error. 300 is
+    sufficient for tabular data of this complexity. We use an eval_set to monitor
+    validation loss and set verbose=False since early stopping is not critical here.
+
+  max_depth=6:
+    The standard default for XGBoost. Deeper trees capture more interactions but
+    overfit faster. For 20-class tabular data, depth 6 gives enough expressiveness
+    while staying regularized.
+
+  learning_rate=0.1:
+    Controls how much each tree updates the overall prediction. Lower = more stable
+    but requires more trees; higher = faster but may overshoot. 0.1 is the canonical
+    starting point for most tabular benchmarks.
+
+  subsample=0.8, colsample_bytree=0.8:
+    Stochastic subsampling: each tree sees 80% of rows and 80% of features. This
+    introduces diversity between trees (similar in spirit to RF's bagging) and acts
+    as regularization, reducing variance and overfitting.
+
+  reg_alpha=0.1 (L1), reg_lambda=1.0 (L2):
+    L1 (Lasso) regularization encourages sparse leaf weights; L2 (Ridge) penalizes
+    large leaf weights. Using both prevents individual trees from fitting noise and
+    helps generalization on the 20-class problem where some classes are very similar
+    (e.g., DoS vs. DoS random vs. DoS disruptive).
+
+  sample_weight (balanced):
+    XGBoost lacks a native class_weight parameter for multi-class. Instead, we compute
+    per-sample weights using sklearn's compute_sample_weight('balanced') and pass them
+    to fit(). The effect is identical to class_weight='balanced' in RF.
+
+k-NN (n_neighbors=11, weights='distance', metric='euclidean',
+       algorithm='ball_tree'):
+
+  n_neighbors=11:
+    Odd number avoids tie-breaking in binary decisions. 11 is large enough to smooth
+    local noise yet small enough to capture local structure. In a 20-class problem
+    with a 50K training subset, k=11 is a reasonable compromise. k=1 would overfit;
+    k=100 would over-smooth class boundaries.
+
+  weights='distance':
+    Closer neighbors vote more strongly than distant ones. For 20-class classification
+    with irregularly shaped class regions, this is more robust than uniform voting
+    (weights='uniform') where a distant, weakly relevant neighbor has equal say.
+
+  metric='euclidean':
+    Standard L2 distance on standardized features. Appropriate after StandardScaler
+    because all features have comparable variance.
+
+  algorithm='ball_tree':
+    Ball tree partitions the feature space into nested hyperspheres, enabling O(log n)
+    approximate nearest-neighbor search. It is efficient for moderate-dimensional data
+    (16 features) and large training sets. 'kd_tree' works similarly but degrades in
+    higher dimensions; 'brute' scales as O(n·d) per query.
+
+
+Q7. What does "feature correlation with the target class" mean (Cell 11)?
+--------------------------------------------------------------------------
+Pearson correlation measures the strength and direction of the *linear* relationship
+between two variables. Its value r is always in [-1, +1]:
+
+  r = +1  → perfect positive linear relationship (as feature increases, class label increases)
+  r = -1  → perfect negative linear relationship
+  r =  0  → no linear relationship
+
+In Cell 11, we compute:
+
+    r(feature_i, class_label)   for each of the 16 features
+
+This tells us whether a feature tends to take larger values in higher-numbered classes
+(higher class IDs) and smaller values in lower-numbered classes (or vice versa).
+
+Important caveats:
+
+1. The class labels are integers 0–19, but they are *categorical*, not ordinal. Class 9
+   (Disruptive) is not "more than" Class 8 (Random speed offset) in any meaningful sense.
+   This means the linear correlation with class label is a rough proxy — it can identify
+   features with broad systematic shifts across classes, but it is not a definitive measure
+   of feature importance for a multi-class problem.
+
+2. A low |r| does not mean a feature is useless. A feature could have near-zero linear
+   correlation with the class label yet still be highly discriminative non-linearly. Tree-
+   based models (RF, XGBoost) can exploit non-linear relationships that Pearson r misses.
+   This is why Cell 29 (RF feature importance) is a more reliable relevance measure.
+
+3. Cell 11's purpose is exploratory: it quickly flags which features show any linear
+   signal before training, and which appear almost independent of the class label under
+   the linear assumption. Speed features (spdx, spdy) and position features tend to show
+   higher |r| because several attack types (Constant Position, Constant Speed) fix those
+   values to constants that deviate systematically from the normal distribution.
+
+In summary, Cell 11 is an EDA tool to build intuition about feature relevance before
+committing to the full modeling pipeline. It is supplemented by the RF feature importance
+chart in Cell 29, which reflects actual predictive power after non-linear tree fitting.
